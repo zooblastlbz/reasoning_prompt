@@ -1,26 +1,20 @@
-import types
-
-
-def apply_patch(pipeline, model_type: str):
+def get_encoder(model_type: str):
     """
-    Apply the encode_prompt monkey patch to the given pipeline.
+    Get the reasoning encoder function by model type.
 
     Args:
-        pipeline: The diffusion pipeline instance.
         model_type: Name of the diffusion model. Supported: "qwen_image".
 
     Returns:
-        The patched pipeline instance.
+        The encode_with_reasoning function for the given model type.
     """
     if model_type == "qwen_image":
-        from .qwen_image_patch import encode_prompt_wrapper
+        from .qwen_image_patch import encode_with_reasoning
+        return encode_with_reasoning
     else:
         raise ValueError(
             f"Unknown model type: '{model_type}'. Supported: 'qwen_image'."
         )
 
-    pipeline.encode_prompt = types.MethodType(encode_prompt_wrapper, pipeline)
-    return pipeline
 
-
-__all__ = ["apply_patch"]
+__all__ = ["get_encoder"]

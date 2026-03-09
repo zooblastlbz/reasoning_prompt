@@ -49,10 +49,8 @@ def load_pipeline(diffusion_model: str, model_path: str, torch_dtype, device):
         device: Target device for this process.
 
     Returns:
-        The loaded pipeline instance (already patched).
+        The loaded pipeline instance.
     """
-    from src.encoding import apply_patch
-
     if diffusion_model == "qwen_image":
         from diffusers import QwenImagePipeline
         pipe = QwenImagePipeline.from_pretrained(model_path, torch_dtype=torch_dtype)
@@ -63,31 +61,7 @@ def load_pipeline(diffusion_model: str, model_path: str, torch_dtype, device):
 
     pipe = pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
-    pipe = apply_patch(pipe, model_type=diffusion_model)
     return pipe
-
-
-def build_prompt_input(metadata: dict, method: str) -> str:
-    """
-    Build the prompt string to pass to the pipeline based on the method.
-
-    Args:
-        metadata: A single GenEval metadata entry (with enhanced fields).
-        method: "baseline" or "with_reasoning".
-
-    Returns:
-        The prompt string (with prefix for with_reasoning).
-    """
-    if method == "baseline":
-        return metadata.get("enhanced_prompt", metadata.get("prompt", ""))
-    elif method == "with_reasoning":
-        prompt_dict = {
-            "reasoning": metadata.get("original_and_reasoning", ""),
-            "enhanced_prompt": metadata.get("enhanced_prompt", metadata.get("prompt", "")),
-        }
-        return f"[WITH_REASONING]{json.dumps(prompt_dict, ensure_ascii=False)}"
-    else:
-        raise ValueError(f"Unknown method: '{method}'. Supported: 'baseline', 'with_reasoning'.")
 
 
 def main():
@@ -112,6 +86,8 @@ def main():
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--negative_prompt", type=str, default=NEGATIVE_PROMPT)
+    parser.add_argument("--max_sequence_length", type=int, default=512,
+                        help="Maximum sequence length for text encoding.")
     args = parser.parse_args()
 
     # Setup distributed state
@@ -122,6 +98,12 @@ def main():
     print(f"[Process {distributed_state.process_index}] Loading {args.diffusion_model} "
           f"from {args.model_path} on {device}...")
     pipe = load_pipeline(args.diffusion_model, args.model_path, torch_dtype, device)
+
+    # Load reasoning encoder if needed
+    encode_with_reasoning = None
+    if args.method == "with_reasoning":
+        from src.encoding import get_encoder
+        encode_with_reasoning = get_encoder(args.diffusion_model)
 
     with open(args.metadata_file, "r", encoding="utf-8") as fp:
         metadatas = [json.loads(line) for line in fp]
@@ -148,7 +130,26 @@ def main():
             with open(os.path.join(outpath, "metadata.jsonl"), "w", encoding="utf-8") as fp:
                 json.dump(metadata, fp, ensure_ascii=False)
 
-            prompt_input = build_prompt_input(metadata, args.method)
+            # Build pipeline call kwargs based on method
+            if args.method == "baseline":
+                prompt_kwargs = {
+                    "prompt": metadata.get("enhanced_prompt", metadata.get("prompt", "")),
+                }
+            else:
+                # with_reasoning: pre-encode, pass prompt_embeds directly
+                reasoning_text = metadata.get("original_and_reasoning", "")
+                enhanced_prompt = metadata.get("enhanced_prompt", metadata.get("prompt", ""))
+                prompt_embeds, prompt_embeds_mask = encode_with_reasoning(
+                    pipe,
+                    reasoning_text=reasoning_text,
+                    enhanced_prompt=enhanced_prompt,
+                    device=device,
+                    max_sequence_length=args.max_sequence_length,
+                )
+                prompt_kwargs = {
+                    "prompt_embeds": prompt_embeds,
+                    "prompt_embeds_mask": prompt_embeds_mask,
+                }
 
             sample_count = 0
             for _ in range((args.n_samples + args.batch_size - 1) // args.batch_size):
@@ -157,13 +158,14 @@ def main():
 
                 with torch.autocast(str(device), dtype=torch_dtype):
                     images = pipe(
-                        prompt=prompt_input,
+                        **prompt_kwargs,
                         negative_prompt=args.negative_prompt,
                         height=args.height,
                         width=args.width,
                         num_inference_steps=args.num_inference_steps,
                         true_cfg_scale=args.guidance_scale,
                         num_images_per_prompt=current_batch,
+                        max_sequence_length=args.max_sequence_length,
                         generator=generator,
                     ).images
 
