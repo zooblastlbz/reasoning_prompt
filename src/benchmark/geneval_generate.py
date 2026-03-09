@@ -3,10 +3,20 @@ GenEval Image Generation.
 
 Generates images for the GenEval benchmark using a specified diffusion model,
 with support for baseline and with_reasoning encoding methods.
+Supports multi-GPU generation via accelerate PartialState.
 Output follows the GenEval directory structure for direct evaluation.
 
-Usage:
+Usage (single GPU):
     python -m src.benchmark.geneval_generate \
+        --diffusion_model qwen_image \
+        --model_path Qwen/Qwen-Image-2512 \
+        --metadata_file data/enhanced/geneval_enhanced.jsonl \
+        --output_dir data/generated_images/geneval_results \
+        --method baseline
+
+Usage (multi-GPU):
+    accelerate launch --num_processes NUM_GPUS \
+        -m src.benchmark.geneval_generate \
         --diffusion_model qwen_image \
         --model_path Qwen/Qwen-Image-2512 \
         --metadata_file data/enhanced/geneval_enhanced.jsonl \
@@ -19,6 +29,7 @@ import json
 import argparse
 import torch
 from tqdm import tqdm
+from accelerate import PartialState
 
 
 NEGATIVE_PROMPT = (
@@ -27,7 +38,7 @@ NEGATIVE_PROMPT = (
 )
 
 
-def load_pipeline(diffusion_model: str, model_path: str, torch_dtype):
+def load_pipeline(diffusion_model: str, model_path: str, torch_dtype, device):
     """
     Load the diffusion pipeline by model name.
 
@@ -35,6 +46,7 @@ def load_pipeline(diffusion_model: str, model_path: str, torch_dtype):
         diffusion_model: Name of the diffusion model. Supported: "qwen_image".
         model_path: Path or HuggingFace ID to the model weights.
         torch_dtype: Torch dtype for the model.
+        device: Target device for this process.
 
     Returns:
         The loaded pipeline instance (already patched).
@@ -49,7 +61,8 @@ def load_pipeline(diffusion_model: str, model_path: str, torch_dtype):
             f"Unknown diffusion model: '{diffusion_model}'. Supported: 'qwen_image'."
         )
 
-    pipe = pipe.to("cuda" if torch.cuda.is_available() else "cpu")
+    pipe = pipe.to(device)
+    pipe.set_progress_bar_config(disable=True)
     pipe = apply_patch(pipe, model_type=diffusion_model)
     return pipe
 
@@ -101,12 +114,14 @@ def main():
     parser.add_argument("--negative_prompt", type=str, default=NEGATIVE_PROMPT)
     args = parser.parse_args()
 
-    # Setup
+    # Setup distributed state
+    distributed_state = PartialState()
+    device = distributed_state.device
     torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print(f"Loading {args.diffusion_model} from {args.model_path} on {device}...")
-    pipe = load_pipeline(args.diffusion_model, args.model_path, torch_dtype)
+    print(f"[Process {distributed_state.process_index}] Loading {args.diffusion_model} "
+          f"from {args.model_path} on {device}...")
+    pipe = load_pipeline(args.diffusion_model, args.model_path, torch_dtype, device)
 
     with open(args.metadata_file, "r", encoding="utf-8") as fp:
         metadatas = [json.loads(line) for line in fp]
@@ -117,40 +132,49 @@ def main():
     base_outpath = os.path.join(args.output_dir, run_name)
     os.makedirs(base_outpath, exist_ok=True)
 
-    for index, metadata in enumerate(tqdm(metadatas, desc="Generating")):
-        outpath = os.path.join(base_outpath, f"{index:0>5}")
-        sample_path = os.path.join(outpath, "samples")
-        os.makedirs(sample_path, exist_ok=True)
+    # Split samples across GPUs using PartialState
+    indexed_metadatas = list(enumerate(metadatas))
+    with distributed_state.split_between_processes(indexed_metadatas) as local_samples:
+        for index, metadata in tqdm(
+            local_samples,
+            desc=f"[GPU {distributed_state.process_index}] Generating",
+            disable=not distributed_state.is_local_main_process,
+        ):
+            outpath = os.path.join(base_outpath, f"{index:0>5}")
+            sample_path = os.path.join(outpath, "samples")
+            os.makedirs(sample_path, exist_ok=True)
 
-        # Save per-prompt metadata (required by GenEval evaluation)
-        with open(os.path.join(outpath, "metadata.jsonl"), "w", encoding="utf-8") as fp:
-            json.dump(metadata, fp, ensure_ascii=False)
+            # Save per-prompt metadata (required by GenEval evaluation)
+            with open(os.path.join(outpath, "metadata.jsonl"), "w", encoding="utf-8") as fp:
+                json.dump(metadata, fp, ensure_ascii=False)
 
-        prompt_input = build_prompt_input(metadata, args.method)
-        print(f"\nPrompt ({index:>3}/{len(metadatas)}): '{metadata.get('prompt', '')}'")
+            prompt_input = build_prompt_input(metadata, args.method)
 
-        sample_count = 0
-        for _ in range((args.n_samples + args.batch_size - 1) // args.batch_size):
-            current_batch = min(args.batch_size, args.n_samples - sample_count)
-            generator = torch.Generator(device=device).manual_seed(args.seed)
+            sample_count = 0
+            for _ in range((args.n_samples + args.batch_size - 1) // args.batch_size):
+                current_batch = min(args.batch_size, args.n_samples - sample_count)
+                generator = torch.Generator(device=device).manual_seed(args.seed)
 
-            with torch.autocast(device, dtype=torch_dtype):
-                images = pipe(
-                    prompt=prompt_input,
-                    negative_prompt=args.negative_prompt,
-                    height=args.height,
-                    width=args.width,
-                    num_inference_steps=args.num_inference_steps,
-                    true_cfg_scale=args.guidance_scale,
-                    num_images_per_prompt=current_batch,
-                    generator=generator,
-                ).images
+                with torch.autocast(str(device), dtype=torch_dtype):
+                    images = pipe(
+                        prompt=prompt_input,
+                        negative_prompt=args.negative_prompt,
+                        height=args.height,
+                        width=args.width,
+                        num_inference_steps=args.num_inference_steps,
+                        true_cfg_scale=args.guidance_scale,
+                        num_images_per_prompt=current_batch,
+                        generator=generator,
+                    ).images
 
-            for image in images:
-                image.save(os.path.join(sample_path, f"{sample_count:05}.png"))
-                sample_count += 1
+                for image in images:
+                    image.save(os.path.join(sample_path, f"{sample_count:05}.png"))
+                    sample_count += 1
 
-    print(f"\nGeneration complete. Results saved to {base_outpath}")
+    # Wait for all processes to finish
+    distributed_state.wait_for_everyone()
+    if distributed_state.is_main_process:
+        print(f"\nGeneration complete. Results saved to {base_outpath}")
 
 
 if __name__ == "__main__":

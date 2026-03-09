@@ -1,13 +1,15 @@
 #!/bin/bash
-# GenEval Image Generation - With Reasoning
+# GenEval Image Generation - With Reasoning (Multi-GPU)
 # Usage: bash scripts/generate_geneval_with_reasoning.sh
 
+NUM_GPUS=8
 DIFFUSION_MODEL="qwen_image"
-MODEL_PATH="Qwen/Qwen-Image-2512"
+MODEL_PATH="/ytech_m2v5_hdd/workspace/kling_mm/Models/Qwen-Image"
 METADATA_FILE="data/enhanced/geneval_enhanced.jsonl"
 OUTPUT_DIR="data/generated_images/geneval_results"
 
-python -m src.benchmark.geneval_generate \
+accelerate launch --num_processes ${NUM_GPUS} \
+    -m src.benchmark.geneval_generate \
     --diffusion_model ${DIFFUSION_MODEL} \
     --model_path ${MODEL_PATH} \
     --metadata_file ${METADATA_FILE} \
