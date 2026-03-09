@@ -1,26 +1,26 @@
 """
-GenEval Image Generation.
+GenAI-Bench Image Generation.
 
-Generates images for the GenEval benchmark using a specified diffusion model,
+Generates images for the GenAI-Bench benchmark using a specified diffusion model,
 with support for baseline and with_reasoning encoding methods.
 Supports multi-GPU generation via accelerate PartialState.
-Output follows the GenEval directory structure for direct evaluation.
+All images are saved in a single flat directory with naming: {id}_sample_{sampleid}.jpeg
 
 Usage (single GPU):
-    python -m src.benchmark.geneval_generate \
+    python -m src.benchmark.genaibench_generate \
         --diffusion_model qwen_image \
         --model_path Qwen/Qwen-Image-2512 \
-        --metadata_file data/enhanced/geneval_enhanced.jsonl \
-        --output_dir data/generated_images/geneval_results \
+        --metadata_file data/enhanced/genaibench_enhanced.json \
+        --output_dir data/generated_images/genaibench_results \
         --method baseline
 
 Usage (multi-GPU):
     accelerate launch --num_processes NUM_GPUS \
-        -m src.benchmark.geneval_generate \
+        -m src.benchmark.genaibench_generate \
         --diffusion_model qwen_image \
         --model_path Qwen/Qwen-Image-2512 \
-        --metadata_file data/enhanced/geneval_enhanced.jsonl \
-        --output_dir data/generated_images/geneval_results \
+        --metadata_file data/enhanced/genaibench_enhanced.json \
+        --output_dir data/generated_images/genaibench_results \
         --method baseline
 """
 
@@ -65,13 +65,13 @@ def load_pipeline(diffusion_model: str, model_path: str, torch_dtype, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate images for GenEval.")
+    parser = argparse.ArgumentParser(description="Generate images for GenAI-Bench.")
     parser.add_argument("--diffusion_model", type=str, required=True,
                         help="Name of the diffusion model (e.g., 'qwen_image').")
     parser.add_argument("--model_path", type=str, required=True,
                         help="Path or HuggingFace ID of the diffusion model.")
     parser.add_argument("--metadata_file", type=str, required=True,
-                        help="Path to the enhanced GenEval metadata JSONL file.")
+                        help="Path to the enhanced GenAI-Bench metadata JSON file.")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Base directory to save generated images.")
     parser.add_argument("--method", type=str, required=True,
@@ -105,40 +105,34 @@ def main():
         from src.encoding import get_encoder
         encode_with_reasoning = get_encoder(args.diffusion_model)
 
+    # Read GenAI-Bench JSON (dict keyed by id)
     with open(args.metadata_file, "r", encoding="utf-8") as fp:
-        metadatas = [json.loads(line) for line in fp]
+        all_data = json.load(fp)
 
-    # GenEval directory structure:
-    # output_dir/geneval-{method}-{scale}-{steps}/{index:05d}/samples/{sample:05d}.png
-    run_name = f"geneval-{args.method}-{int(args.guidance_scale)}-{args.num_inference_steps}"
-    base_outpath = os.path.join(args.output_dir, run_name)
-    os.makedirs(base_outpath, exist_ok=True)
+    # Build ordered list of (id, entry) pairs
+    items = [(entry_id, entry) for entry_id, entry in all_data.items()]
 
-    # Split samples across GPUs using PartialState
-    indexed_metadatas = list(enumerate(metadatas))
-    with distributed_state.split_between_processes(indexed_metadatas) as local_samples:
-        for index, metadata in tqdm(
-            local_samples,
+    # Output directory: output_dir/genaibench-{method}-{scale}-{steps}/
+    run_name = f"genaibench-{args.method}-{int(args.guidance_scale)}-{args.num_inference_steps}"
+    image_dir = os.path.join(args.output_dir, run_name)
+    os.makedirs(image_dir, exist_ok=True)
+
+    # Split across GPUs using PartialState
+    with distributed_state.split_between_processes(items) as local_items:
+        for entry_id, entry in tqdm(
+            local_items,
             desc=f"[GPU {distributed_state.process_index}] Generating",
             disable=not distributed_state.is_local_main_process,
         ):
-            outpath = os.path.join(base_outpath, f"{index:0>5}")
-            sample_path = os.path.join(outpath, "samples")
-            os.makedirs(sample_path, exist_ok=True)
-
-            # Save per-prompt metadata (required by GenEval evaluation)
-            with open(os.path.join(outpath, "metadata.jsonl"), "w", encoding="utf-8") as fp:
-                json.dump(metadata, fp, ensure_ascii=False)
-
             # Build pipeline call kwargs based on method
             if args.method == "baseline":
                 prompt_kwargs = {
-                    "prompt": metadata.get("enhanced_prompt", metadata.get("prompt", "")),
+                    "prompt": entry.get("enhanced_prompt", entry.get("prompt", "")),
                 }
             else:
                 # with_reasoning: pre-encode, pass prompt_embeds directly
-                reasoning_text = metadata.get("original_and_reasoning", "")
-                enhanced_prompt = metadata.get("enhanced_prompt", metadata.get("prompt", ""))
+                reasoning_text = entry.get("original_and_reasoning", "")
+                enhanced_prompt = entry.get("enhanced_prompt", entry.get("prompt", ""))
                 prompt_embeds, prompt_embeds_mask = encode_with_reasoning(
                     pipe,
                     reasoning_text=reasoning_text,
@@ -154,9 +148,8 @@ def main():
             sample_count = 0
             for _ in range((args.n_samples + args.batch_size - 1) // args.batch_size):
                 current_batch = min(args.batch_size, args.n_samples - sample_count)
-                # Each sample gets a unique but reproducible seed:
-                # seed + index * n_samples + sample_count
-                sample_seed = args.seed + index * args.n_samples + sample_count
+                # Each sample gets a unique but reproducible seed
+                sample_seed = args.seed + int(entry_id) * args.n_samples + sample_count
                 generator = torch.Generator(device=device).manual_seed(sample_seed)
 
                 with torch.autocast(str(device), dtype=torch_dtype):
@@ -173,13 +166,15 @@ def main():
                     ).images
 
                 for image in images:
-                    image.save(os.path.join(sample_path, f"{sample_count:05}.png"))
+                    # Naming: {id}_sample_{sampleid}.jpeg
+                    filename = f"{entry_id}_sample_{sample_count}.jpeg"
+                    image.save(os.path.join(image_dir, filename))
                     sample_count += 1
 
     # Wait for all processes to finish
     distributed_state.wait_for_everyone()
     if distributed_state.is_main_process:
-        print(f"\nGeneration complete. Results saved to {base_outpath}")
+        print(f"\nGeneration complete. Results saved to {image_dir}")
 
 
 if __name__ == "__main__":
