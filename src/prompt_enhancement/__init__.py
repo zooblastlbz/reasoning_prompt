@@ -8,7 +8,8 @@ def get_enhancer(name: str, **kwargs) -> BasePromptEnhancer:
 
     Args:
         name: Name of the enhancer. Supported: "hunyuan".
-        **kwargs: Arguments passed to the enhancer constructor (e.g., models_root_path).
+        **kwargs: Arguments passed to the enhancer constructor
+                  (e.g., models_root_path, backend="vllm").
 
     Returns:
         An instance of the requested prompt enhancer.
