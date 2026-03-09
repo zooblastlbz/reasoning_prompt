@@ -45,6 +45,72 @@ def encode_with_reasoning(
     return prompt_embeds, prompt_embeds_mask
 
 
+def encode_with_weighted_reasoning(
+    pipeline,
+    reasoning_text: str,
+    enhanced_prompt: str,
+    alpha: float = 0.5,
+    device: Optional[torch.device] = None,
+    max_sequence_length: int = 512,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Weighted combination of reasoning-aware and reasoning-free hidden states.
+
+    Computes:
+        final_embeds = alpha * reasoning_embeds + (1 - alpha) * plain_embeds
+
+    where reasoning_embeds are the enhanced_prompt hidden states extracted from
+    encoding the full (reasoning + enhanced_prompt) text, and plain_embeds are
+    the hidden states from encoding enhanced_prompt alone.
+
+    Args:
+        pipeline: The QwenImagePipeline instance.
+        reasoning_text: The reasoning context (original_prompt + reasoning).
+        enhanced_prompt: The final enhanced prompt.
+        alpha: Weight for reasoning-aware embeds. 1.0 = pure reasoning,
+               0.0 = pure plain encoding. Default: 0.5.
+        device: Target device.
+        max_sequence_length: Maximum sequence length for the output embeddings.
+
+    Returns:
+        tuple: (prompt_embeds, prompt_embeds_mask) ready to pass to pipeline.__call__.
+    """
+    device = device or pipeline._execution_device
+
+    # 1. Encode WITH reasoning context, slice out enhanced_prompt hidden states
+    reasoning_embeds, reasoning_mask = encode_with_reasoning(
+        pipeline, reasoning_text, enhanced_prompt, device, max_sequence_length,
+    )
+
+    # 2. Encode WITHOUT reasoning context (plain enhanced_prompt only)
+    plain_embeds, plain_mask = pipeline._get_qwen_prompt_embeds(
+        [enhanced_prompt], device
+    )
+    # Truncate to max_sequence_length to match downstream expectations
+    plain_embeds = plain_embeds[:, :max_sequence_length]
+
+    # 3. Align sequence lengths — pad the shorter one to match the longer
+    r_len = reasoning_embeds.shape[1]
+    p_len = plain_embeds.shape[1]
+    hidden_dim = reasoning_embeds.shape[2]
+
+    if r_len < p_len:
+        pad = torch.zeros((1, p_len - r_len, hidden_dim), device=device, dtype=reasoning_embeds.dtype)
+        reasoning_embeds = torch.cat([reasoning_embeds, pad], dim=1)
+    elif p_len < r_len:
+        pad = torch.zeros((1, r_len - p_len, hidden_dim), device=device, dtype=plain_embeds.dtype)
+        plain_embeds = torch.cat([plain_embeds, pad], dim=1)
+
+    # 4. Weighted combination
+    final_embeds = alpha * reasoning_embeds + (1 - alpha) * plain_embeds
+
+    # 5. All-ones mask to ensure encode_prompt sets mask=None
+    seq_len = final_embeds.shape[1]
+    final_mask = torch.ones((1, seq_len), device=device, dtype=torch.long)
+
+    return final_embeds, final_mask
+
+
 def batch_encode_with_reasoning(
     pipeline,
     reasoning_texts: list[str],

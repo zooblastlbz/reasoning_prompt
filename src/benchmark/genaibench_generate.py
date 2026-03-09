@@ -75,8 +75,8 @@ def main():
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Base directory to save generated images.")
     parser.add_argument("--method", type=str, required=True,
-                        choices=["baseline", "with_reasoning"],
-                        help="Encoding method: 'baseline' or 'with_reasoning'.")
+                        choices=["baseline", "with_reasoning", "weighted_reasoning"],
+                        help="Encoding method: 'baseline', 'with_reasoning', or 'weighted_reasoning'.")
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--guidance_scale", type=float, default=4.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -88,6 +88,9 @@ def main():
     parser.add_argument("--negative_prompt", type=str, default=NEGATIVE_PROMPT)
     parser.add_argument("--max_sequence_length", type=int, default=512,
                         help="Maximum sequence length for text encoding.")
+    parser.add_argument("--alpha", type=float, default=0.5,
+                        help="Weight for reasoning-aware embeds in weighted_reasoning method. "
+                             "1.0 = pure reasoning, 0.0 = pure plain. Default: 0.5.")
     args = parser.parse_args()
 
     # Setup distributed state
@@ -100,10 +103,10 @@ def main():
     pipe = load_pipeline(args.diffusion_model, args.model_path, torch_dtype, device)
 
     # Load reasoning encoder if needed
-    encode_with_reasoning = None
-    if args.method == "with_reasoning":
+    encode_fn = None
+    if args.method in ("with_reasoning", "weighted_reasoning"):
         from src.encoding import get_encoder
-        encode_with_reasoning = get_encoder(args.diffusion_model)
+        encode_fn = get_encoder(args.diffusion_model, method=args.method)
 
     # Read GenAI-Bench JSON (dict keyed by id)
     with open(args.metadata_file, "r", encoding="utf-8") as fp:
@@ -129,14 +132,29 @@ def main():
                 prompt_kwargs = {
                     "prompt": entry.get("enhanced_prompt", entry.get("prompt", "")),
                 }
-            else:
-                # with_reasoning: pre-encode, pass prompt_embeds directly
+            elif args.method == "with_reasoning":
                 reasoning_text = entry.get("original_and_reasoning", "")
                 enhanced_prompt = entry.get("enhanced_prompt", entry.get("prompt", ""))
-                prompt_embeds, prompt_embeds_mask = encode_with_reasoning(
+                prompt_embeds, prompt_embeds_mask = encode_fn(
                     pipe,
                     reasoning_text=reasoning_text,
                     enhanced_prompt=enhanced_prompt,
+                    device=device,
+                    max_sequence_length=args.max_sequence_length,
+                )
+                prompt_kwargs = {
+                    "prompt_embeds": prompt_embeds,
+                    "prompt_embeds_mask": prompt_embeds_mask,
+                }
+            else:
+                # weighted_reasoning
+                reasoning_text = entry.get("original_and_reasoning", "")
+                enhanced_prompt = entry.get("enhanced_prompt", entry.get("prompt", ""))
+                prompt_embeds, prompt_embeds_mask = encode_fn(
+                    pipe,
+                    reasoning_text=reasoning_text,
+                    enhanced_prompt=enhanced_prompt,
+                    alpha=args.alpha,
                     device=device,
                     max_sequence_length=args.max_sequence_length,
                 )
