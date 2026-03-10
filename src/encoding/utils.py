@@ -125,141 +125,100 @@ def slice_hidden_states_by_prefix(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Slice hidden states that correspond to the enhanced_prompt tokens only,
-    explicitly EXCLUDING the '[ENHANCED]: ' prefix tokens.
+    excluding the '[ENHANCED]:' prefix tokens.
 
-    Uses char_to_token mapping (from the tokenizer's encoding with
-    return_offsets_mapping / offset_mapping) to convert the known character-level
-    start position of enhanced_prompt into a token index.  This is robust to BPE
-    context effects that break sub-sequence token matching.
+    Strategy (no return_offsets_mapping needed, works with slow tokenizers):
+    -------------------------------------------------------------------------
+    Because build_prefixed_full_text separates sections with '\\n' — a token
+    that tiktoken/BPE *always* splits independently — we can safely tokenize
+    the prefix part and the enhanced_prompt part *separately* and trust that
+    their token counts add up correctly inside the full tokenization.
 
-    Args:
-        enhanced_char_starts: Character-level start offset of enhanced_prompt
-            inside each full_text (as returned by build_prefixed_full_text).
-            If None, it is recomputed by searching for ENHANCED_PREFIX in the
-            plain full_text string (fast string search, no tokenization needed).
+    Concretely, for the template-wrapped text:
+        wrapped = template.format(full_text)
+               = <template_prefix> + full_text
+               = <template_prefix> + prefix_part + enhanced_prompt
+
+    We tokenize <template_prefix> + prefix_part together (without the
+    enhanced_prompt), count the resulting tokens, subtract drop_idx to get
+    hs_start, then tokenize enhanced_prompt alone to get target_len.
+
+    This is valid because:
+      1. The trailing '\\n' of prefix_part is always its own token — it never
+         merges with the first token of enhanced_prompt.
+      2. drop_idx is the number of template-prefix tokens the pipeline strips.
     """
-    template  = pipeline.prompt_template_encode
-    drop_idx  = pipeline.prompt_template_encode_start_idx
+    template = pipeline.prompt_template_encode
+    drop_idx = pipeline.prompt_template_encode_start_idx
 
     sliced_embeds_list = []
 
     for i in range(len(full_texts)):
         full_text = full_texts[i]
+        enhanced_prompt = enhanced_prompts[i]
 
-        # ── 1. Determine char-level start of enhanced_prompt ─────────────────
+        # ── 1. Reconstruct prefix_part (everything before enhanced_prompt) ───
         if enhanced_char_starts is not None:
-            char_start = enhanced_char_starts[i]
+            # char start is known — slice directly
+            prefix_part = full_text[: enhanced_char_starts[i]]
         else:
-            # Fallback: plain string search — always correct regardless of BPE
+            # Fallback: find via string search (always correct, no tokenizer)
             idx = full_text.rfind(ENHANCED_PREFIX)
             if idx == -1:
                 print(
-                    f"Warning: '[ENHANCED]: ' prefix not found in full_text[{i}] "
-                    "(string search). Using all valid hidden states."
+                    f"Warning: ENHANCED_PREFIX not found in full_text[{i}]. "
+                    "Using all valid hidden states."
                 )
                 valid_len = (
                     int(prompt_embeds_mask[i].sum().item())
                     if prompt_embeds_mask is not None
                     else prompt_embeds.shape[1]
                 )
-                sliced_embed = prompt_embeds[i, :valid_len, :]
-                sliced_embed = sliced_embed[:max_sequence_length]
-                sliced_embeds_list.append(sliced_embed)
-                continue
-            char_start = idx + len(ENHANCED_PREFIX)
-
-        # ── 2. Tokenize the template-wrapped full_text WITH offset_mapping ────
-        wrapped = template.format(full_text)
-
-        # Compute char offset introduced by the template prefix
-        # (the template wraps the raw text, so we need to shift char_start)
-        template_prefix_len = wrapped.find(full_text)
-        if template_prefix_len == -1:
-            # Unlikely, but guard: search for enhanced_prompt directly
-            template_prefix_len = wrapped.find(enhanced_prompts[i])
-            if template_prefix_len != -1:
-                char_start_in_wrapped = template_prefix_len
-            else:
-                print(
-                    f"Warning: could not locate full_text inside template-wrapped "
-                    f"string for sample [{i}]. Using all valid hidden states."
+                sliced_embeds_list.append(
+                    prompt_embeds[i, :valid_len, :][:max_sequence_length]
                 )
-                valid_len = (
-                    int(prompt_embeds_mask[i].sum().item())
-                    if prompt_embeds_mask is not None
-                    else prompt_embeds.shape[1]
-                )
-                sliced_embed = prompt_embeds[i, :valid_len, :]
-                sliced_embed = sliced_embed[:max_sequence_length]
-                sliced_embeds_list.append(sliced_embed)
                 continue
-        else:
-            char_start_in_wrapped = template_prefix_len + char_start
+            # prefix_part ends right after the trailing \n of ENHANCED_PREFIX\n
+            char_start = idx + len(ENHANCED_PREFIX) + 1  # +1 for the \n separator
+            prefix_part = full_text[:char_start]
 
-        encoding = pipeline.tokenizer(
-            wrapped,
-            add_special_tokens=False,
-            return_offsets_mapping=True,
+        # ── 2. Build the template-wrapped prefix (no enhanced_prompt) ─────────
+        # template.format(x) inserts x; we want everything up to enhanced_prompt
+        # inside the wrapped string, i.e. template.format(prefix_part) gives us
+        # exactly <template_prefix> + prefix_part.
+        wrapped_prefix = template.format(prefix_part)
+
+        # ── 3. Count tokens in wrapped_prefix → tells us where enhanced_prompt
+        #       starts in the full token sequence ─────────────────────────────
+        prefix_token_count = len(
+            pipeline.tokenizer(wrapped_prefix, add_special_tokens=False).input_ids
         )
-        offset_mapping = encoding["offset_mapping"]  # list of (char_start, char_end)
 
-        # ── 3. Map char position → token index via offset_mapping ─────────────
-        token_start_in_wrapped = None
-        for tok_idx, (tok_char_start, tok_char_end) in enumerate(offset_mapping):
-            if tok_char_start == char_start_in_wrapped:
-                token_start_in_wrapped = tok_idx
-                break
-            # Handle the case where char_start_in_wrapped falls inside a token
-            if tok_char_start < char_start_in_wrapped < tok_char_end:
-                token_start_in_wrapped = tok_idx
-                break
+        # ── 4. Count tokens in enhanced_prompt alone ──────────────────────────
+        # Safe because the leading \n boundary means BPE will produce the same
+        # tokens for enhanced_prompt regardless of surrounding context.
+        target_ids = pipeline.tokenizer(
+            enhanced_prompt, add_special_tokens=False
+        ).input_ids
+        target_len = len(target_ids)
 
-        if token_start_in_wrapped is None:
+        # ── 5. Convert to hidden-state index (subtract drop_idx) ─────────────
+        hs_start = prefix_token_count - drop_idx
+        if hs_start < 0:
             print(
-                f"Warning: char offset {char_start_in_wrapped} not found in "
-                f"offset_mapping for sample [{i}]. Falling back to string search "
-                f"on wrapped text."
+                f"Warning: hs_start={hs_start} < 0 for sample [{i}] "
+                "(prefix shorter than drop_idx?). Using all valid hidden states."
             )
-            # Last-resort: search for enhanced_prompt text in wrapped string
-            char_start_in_wrapped = wrapped.rfind(enhanced_prompts[i])
-            if char_start_in_wrapped == -1:
-                valid_len = (
-                    int(prompt_embeds_mask[i].sum().item())
-                    if prompt_embeds_mask is not None
-                    else prompt_embeds.shape[1]
-                )
-                sliced_embed = prompt_embeds[i, :valid_len, :]
-                sliced_embed = sliced_embed[:max_sequence_length]
-                sliced_embeds_list.append(sliced_embed)
-                continue
-            for tok_idx, (tok_char_start, tok_char_end) in enumerate(offset_mapping):
-                if tok_char_start >= char_start_in_wrapped:
-                    token_start_in_wrapped = tok_idx
-                    break
-
-        if token_start_in_wrapped is None:
-            # Still not found — use all valid hidden states
             valid_len = (
                 int(prompt_embeds_mask[i].sum().item())
                 if prompt_embeds_mask is not None
                 else prompt_embeds.shape[1]
             )
-            sliced_embed = prompt_embeds[i, :valid_len, :]
-            sliced_embed = sliced_embed[:max_sequence_length]
-            sliced_embeds_list.append(sliced_embed)
+            sliced_embeds_list.append(
+                prompt_embeds[i, :valid_len, :][:max_sequence_length]
+            )
             continue
 
-        # ── 4. Compute length of enhanced_prompt in tokens ────────────────────
-        enhanced_char_end = char_start_in_wrapped + len(enhanced_prompts[i])
-        token_end_in_wrapped = len(offset_mapping)
-        for tok_idx, (tok_char_start, _) in enumerate(offset_mapping):
-            if tok_char_start >= enhanced_char_end:
-                token_end_in_wrapped = tok_idx
-                break
-        target_len = token_end_in_wrapped - token_start_in_wrapped
-
-        # ── 5. Convert to hidden-state index space (subtract drop_idx) ────────
-        hs_start = token_start_in_wrapped - drop_idx
         sliced_embed = prompt_embeds[i, hs_start : hs_start + target_len, :]
         sliced_embed = sliced_embed[:max_sequence_length]
         sliced_embeds_list.append(sliced_embed)
