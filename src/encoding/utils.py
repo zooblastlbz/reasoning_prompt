@@ -114,23 +114,14 @@ def slice_hidden_states_by_prefix(
     Slice hidden states that correspond to the enhanced_prompt tokens only,
     explicitly EXCLUDING the '[ENHANCED]: ' prefix tokens.
 
-    Strategy
-    --------
-    For each sample we tokenize:
-      1. full_text  → find the absolute position of the ENHANCED_PREFIX inside it
-      2. prefix     → count how many tokens the prefix occupies
-      3. target     → the enhanced_prompt tokens (without special tokens)
-
-    The slice window is [prefix_end_idx : prefix_end_idx + target_len].
-
-    This guarantees we never include the '[ENHANCED]: ' tokens in the final
-    embeddings that are passed to the diffusion model.
-
-    Returns
-    -------
-    (final_embeds, final_masks) — same format as slice_hidden_states.
+    Key: tokenize the template-wrapped full_text (matching get_qwen_prompt_embeds_no_limit),
+    then subtract drop_idx so indices align with the hidden states AFTER the template
+    prefix has been stripped.
     """
-    # Tokenize the prefix once (it is the same for every sample)
+    template  = pipeline.prompt_template_encode
+    drop_idx  = pipeline.prompt_template_encode_start_idx
+
+    # Tokenize the ENHANCED prefix once (no special tokens, no template)
     prefix_ids = pipeline.tokenizer(
         ENHANCED_PREFIX, add_special_tokens=False
     ).input_ids
@@ -139,31 +130,26 @@ def slice_hidden_states_by_prefix(
     sliced_embeds_list = []
 
     for i in range(len(full_texts)):
-        full_ids = pipeline.tokenizer(full_texts[i]).input_ids
+        # ── Tokenize exactly as done during encoding (with template) ──────────
+        wrapped = template.format(full_texts[i])
+        full_ids = pipeline.tokenizer(wrapped, add_special_tokens=False).input_ids
+
         target_ids = pipeline.tokenizer(
             enhanced_prompts[i], add_special_tokens=False
         ).input_ids
         target_len = len(target_ids)
 
-        # ── Step 1: find '[ENHANCED]: ' inside full_ids ──────────────────────
+        # ── Find LAST occurrence of ENHANCED_PREFIX inside full_ids ───────────
         prefix_start = -1
-        for j in range(len(full_ids) - prefix_len + 1):
-            if full_ids[j : j + prefix_len] == prefix_ids:
-                prefix_start = j
-                # Take the LAST occurrence (in case the prefix string appears
-                # earlier by coincidence)
-                # We intentionally keep iterating to get the last match.
-        # Use last match: search from end
         for j in range(len(full_ids) - prefix_len, -1, -1):
             if full_ids[j : j + prefix_len] == prefix_ids:
                 prefix_start = j
                 break
 
         if prefix_start == -1:
-            # Fallback: prefix not found — use the plain subseq-match strategy
             print(
-                f"Warning: '[ENHANCED]: ' prefix not found in full_text[{i}]. "
-                "Falling back to plain token match."
+                f"Warning: '[ENHANCED]: ' prefix not found in full_text[{i}] "
+                "(template-wrapped). Falling back to plain token match."
             )
             start_idx = -1
             for j in range(len(full_ids) - target_len + 1):
@@ -175,16 +161,23 @@ def slice_hidden_states_by_prefix(
                     f"Warning: enhanced_prompt tokens not found in full_text[{i}]. "
                     "Using all valid hidden states."
                 )
-                valid_len = int(prompt_embeds_mask[i].sum().item()) if prompt_embeds_mask is not None else prompt_embeds.shape[1]
+                valid_len = (
+                    int(prompt_embeds_mask[i].sum().item())
+                    if prompt_embeds_mask is not None
+                    else prompt_embeds.shape[1]
+                )
                 sliced_embed = prompt_embeds[i, :valid_len, :]
             else:
-                sliced_embed = prompt_embeds[i, start_idx : start_idx + target_len, :]
+                # start_idx is in the wrapped-token space; subtract drop_idx
+                hs_start = start_idx - drop_idx
+                sliced_embed = prompt_embeds[i, hs_start : hs_start + target_len, :]
         else:
-            # ── Step 2: the enhanced_prompt starts right after the prefix ────
-            enhanced_start = prefix_start + prefix_len
-            sliced_embed = prompt_embeds[i, enhanced_start : enhanced_start + target_len, :]
+            # enhanced_prompt starts right after the prefix in wrapped-token space
+            enhanced_start_in_full = prefix_start + prefix_len
+            # Subtract drop_idx to get the index in the hidden-state tensor
+            hs_start = enhanced_start_in_full - drop_idx
+            sliced_embed = prompt_embeds[i, hs_start : hs_start + target_len, :]
 
-        # Truncate to max_sequence_length
         sliced_embed = sliced_embed[:max_sequence_length]
         sliced_embeds_list.append(sliced_embed)
 
