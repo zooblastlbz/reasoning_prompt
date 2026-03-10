@@ -42,19 +42,20 @@ def encode_with_reasoning(
     """
     device = device or pipeline._execution_device
 
-    # 1. Build three-part prefixed text
-    full_text = build_prefixed_full_text(origin_prompt, think, enhanced_prompt)
+    # 1. Build three-part prefixed text — also get char-level start of enhanced_prompt
+    full_text, enhanced_char_start = build_prefixed_full_text(origin_prompt, think, enhanced_prompt)
 
     # 2. Encode without length limit
     full_prompt_embeds, full_prompt_embeds_mask = get_qwen_prompt_embeds_no_limit(
         pipeline, [full_text], device
     )
 
-    # 3. Slice out enhanced_prompt hidden states, excluding the prefix tokens
+    # 3. Slice out enhanced_prompt hidden states using char offset (BPE-safe)
     prompt_embeds, prompt_embeds_mask = slice_hidden_states_by_prefix(
         pipeline, [full_text], [enhanced_prompt],
         full_prompt_embeds, full_prompt_embeds_mask,
         device, max_sequence_length,
+        enhanced_char_starts=[enhanced_char_start],
     )
 
     return prompt_embeds, prompt_embeds_mask
@@ -149,10 +150,13 @@ def batch_encode_with_reasoning(
     """
     device = device or pipeline._execution_device
 
-    full_texts = [
-        build_prefixed_full_text(o, t, e)
-        for o, t, e in zip(origin_prompts, thinks, enhanced_prompts)
-    ]
+    # Build texts and collect char-level offsets in one pass
+    full_texts = []
+    enhanced_char_starts = []
+    for o, t, e in zip(origin_prompts, thinks, enhanced_prompts):
+        full_text, char_start = build_prefixed_full_text(o, t, e)
+        full_texts.append(full_text)
+        enhanced_char_starts.append(char_start)
 
     full_prompt_embeds, full_prompt_embeds_mask = get_qwen_prompt_embeds_no_limit(
         pipeline, full_texts, device
@@ -162,6 +166,7 @@ def batch_encode_with_reasoning(
         pipeline, full_texts, enhanced_prompts,
         full_prompt_embeds, full_prompt_embeds_mask,
         device, max_sequence_length,
+        enhanced_char_starts=enhanced_char_starts,
     )
 
     return prompt_embeds, prompt_embeds_mask
