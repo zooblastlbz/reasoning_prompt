@@ -1,42 +1,57 @@
 import json
 import torch
 from typing import Union, List, Optional
-from .utils import slice_hidden_states
+from .utils import (
+    build_prefixed_full_text,
+    get_qwen_prompt_embeds_no_limit,
+    slice_hidden_states_by_prefix,
+    slice_hidden_states,
+)
 
 
 def encode_with_reasoning(
     pipeline,
-    reasoning_text: str,
+    origin_prompt: str,
+    think: str,
     enhanced_prompt: str,
     device: Optional[torch.device] = None,
     max_sequence_length: int = 512,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Encode the full text (reasoning + enhanced prompt) using the pipeline's text encoder,
-    then slice out only the hidden states corresponding to the enhanced prompt.
+    Encode a three-part full text (origin_prompt / think / enhanced_prompt) using
+    the pipeline's text encoder WITHOUT any token-length cap, then slice out only
+    the hidden states that correspond to the enhanced_prompt tokens.
+
+    Each section is annotated with a plain-text prefix:
+        [ORIGIN]: {origin_prompt}
+        [THINK]:  {think}
+        [ENHANCED]: {enhanced_prompt}
+
+    The prefix tokens of [ENHANCED] are excluded from the returned embeddings.
 
     Args:
-        pipeline: The QwenImagePipeline instance (unpatched).
-        reasoning_text: The reasoning context (original_prompt + reasoning).
-        enhanced_prompt: The final enhanced prompt.
-        device: Target device.
-        max_sequence_length: Maximum sequence length for the output embeddings.
+        pipeline:             QwenImagePipeline instance.
+        origin_prompt:        The original user prompt.
+        think:                The reasoning text produced by the enhancer.
+        enhanced_prompt:      The final enhanced prompt to generate from.
+        device:               Target device.
+        max_sequence_length:  Max tokens kept from the enhanced_prompt slice.
 
     Returns:
-        tuple: (prompt_embeds, prompt_embeds_mask) ready to pass to pipeline.__call__.
+        (prompt_embeds, prompt_embeds_mask) ready for pipeline.__call__.
     """
     device = device or pipeline._execution_device
 
-    # 1. Concatenate reasoning and enhanced prompt as a single text
-    full_text = f"{reasoning_text}\n{enhanced_prompt}"
+    # 1. Build three-part prefixed text
+    full_text = build_prefixed_full_text(origin_prompt, think, enhanced_prompt)
 
-    # 2. Encode the full concatenated text using the pipeline's own text encoder
-    full_prompt_embeds, full_prompt_embeds_mask = pipeline._get_qwen_prompt_embeds(
-        [full_text], device
+    # 2. Encode without length limit
+    full_prompt_embeds, full_prompt_embeds_mask = get_qwen_prompt_embeds_no_limit(
+        pipeline, [full_text], device
     )
 
-    # 3. Slice out the hidden states corresponding to the enhanced prompt only
-    prompt_embeds, prompt_embeds_mask = slice_hidden_states(
+    # 3. Slice out enhanced_prompt hidden states, excluding the prefix tokens
+    prompt_embeds, prompt_embeds_mask = slice_hidden_states_by_prefix(
         pipeline, [full_text], [enhanced_prompt],
         full_prompt_embeds, full_prompt_embeds_mask,
         device, max_sequence_length,
@@ -47,7 +62,8 @@ def encode_with_reasoning(
 
 def encode_with_weighted_reasoning(
     pipeline,
-    reasoning_text: str,
+    origin_prompt: str,
+    think: str,
     enhanced_prompt: str,
     alpha: float = 0.5,
     device: Optional[torch.device] = None,
@@ -59,37 +75,35 @@ def encode_with_weighted_reasoning(
     Computes:
         final_embeds = alpha * reasoning_embeds + (1 - alpha) * plain_embeds
 
-    where reasoning_embeds are the enhanced_prompt hidden states extracted from
-    encoding the full (reasoning + enhanced_prompt) text, and plain_embeds are
-    the hidden states from encoding enhanced_prompt alone.
+    where reasoning_embeds are the enhanced_prompt hidden states sliced from the
+    three-part prefixed encoding, and plain_embeds are the hidden states from
+    encoding the enhanced_prompt alone (standard pipeline call).
 
     Args:
-        pipeline: The QwenImagePipeline instance.
-        reasoning_text: The reasoning context (original_prompt + reasoning).
-        enhanced_prompt: The final enhanced prompt.
-        alpha: Weight for reasoning-aware embeds. 1.0 = pure reasoning,
-               0.0 = pure plain encoding. Default: 0.5.
-        device: Target device.
-        max_sequence_length: Maximum sequence length for the output embeddings.
+        pipeline:             QwenImagePipeline instance.
+        origin_prompt:        The original user prompt.
+        think:                The reasoning text produced by the enhancer.
+        enhanced_prompt:      The final enhanced prompt.
+        alpha:                Weight for reasoning-aware embeds.
+                              1.0 = pure reasoning, 0.0 = pure plain.
+        device:               Target device.
+        max_sequence_length:  Max tokens for the output embeddings.
 
     Returns:
-        tuple: (prompt_embeds, prompt_embeds_mask) ready to pass to pipeline.__call__.
+        (prompt_embeds, prompt_embeds_mask) ready for pipeline.__call__.
     """
     device = device or pipeline._execution_device
 
-    # 1. Encode WITH reasoning context, slice out enhanced_prompt hidden states
-    reasoning_embeds, reasoning_mask = encode_with_reasoning(
-        pipeline, reasoning_text, enhanced_prompt, device, max_sequence_length,
+    # 1. Reasoning-aware embeds (three-part encoding → slice enhanced_prompt)
+    reasoning_embeds, _ = encode_with_reasoning(
+        pipeline, origin_prompt, think, enhanced_prompt, device, max_sequence_length,
     )
 
-    # 2. Encode WITHOUT reasoning context (plain enhanced_prompt only)
-    plain_embeds, plain_mask = pipeline._get_qwen_prompt_embeds(
-        [enhanced_prompt], device
-    )
-    # Truncate to max_sequence_length to match downstream expectations
+    # 2. Plain embeds (encode enhanced_prompt alone, original pipeline function)
+    plain_embeds, _ = pipeline._get_qwen_prompt_embeds([enhanced_prompt], device)
     plain_embeds = plain_embeds[:, :max_sequence_length]
 
-    # 3. Align sequence lengths — pad the shorter one to match the longer
+    # 3. Align sequence lengths
     r_len = reasoning_embeds.shape[1]
     p_len = plain_embeds.shape[1]
     hidden_dim = reasoning_embeds.shape[2]
@@ -104,7 +118,7 @@ def encode_with_weighted_reasoning(
     # 4. Weighted combination
     final_embeds = alpha * reasoning_embeds + (1 - alpha) * plain_embeds
 
-    # 5. All-ones mask to ensure encode_prompt sets mask=None
+    # 5. All-ones mask
     seq_len = final_embeds.shape[1]
     final_mask = torch.ones((1, seq_len), device=device, dtype=torch.long)
 
@@ -113,7 +127,8 @@ def encode_with_weighted_reasoning(
 
 def batch_encode_with_reasoning(
     pipeline,
-    reasoning_texts: list[str],
+    origin_prompts: list[str],
+    thinks: list[str],
     enhanced_prompts: list[str],
     device: Optional[torch.device] = None,
     max_sequence_length: int = 512,
@@ -122,26 +137,28 @@ def batch_encode_with_reasoning(
     Batch version of encode_with_reasoning.
 
     Args:
-        pipeline: The QwenImagePipeline instance (unpatched).
-        reasoning_texts: List of reasoning contexts.
-        enhanced_prompts: List of enhanced prompts.
-        device: Target device.
-        max_sequence_length: Maximum sequence length for the output embeddings.
+        pipeline:          QwenImagePipeline instance.
+        origin_prompts:    List of original user prompts.
+        thinks:            List of reasoning texts.
+        enhanced_prompts:  List of enhanced prompts.
+        device:            Target device.
+        max_sequence_length: Max tokens for the output embeddings.
 
     Returns:
-        tuple: (prompt_embeds, prompt_embeds_mask) ready to pass to pipeline.__call__.
+        (prompt_embeds, prompt_embeds_mask) ready for pipeline.__call__.
     """
     device = device or pipeline._execution_device
 
     full_texts = [
-        f"{r}\n{e}" for r, e in zip(reasoning_texts, enhanced_prompts)
+        build_prefixed_full_text(o, t, e)
+        for o, t, e in zip(origin_prompts, thinks, enhanced_prompts)
     ]
 
-    full_prompt_embeds, full_prompt_embeds_mask = pipeline._get_qwen_prompt_embeds(
-        full_texts, device
+    full_prompt_embeds, full_prompt_embeds_mask = get_qwen_prompt_embeds_no_limit(
+        pipeline, full_texts, device
     )
 
-    prompt_embeds, prompt_embeds_mask = slice_hidden_states(
+    prompt_embeds, prompt_embeds_mask = slice_hidden_states_by_prefix(
         pipeline, full_texts, enhanced_prompts,
         full_prompt_embeds, full_prompt_embeds_mask,
         device, max_sequence_length,

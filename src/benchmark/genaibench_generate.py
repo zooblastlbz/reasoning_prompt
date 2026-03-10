@@ -133,11 +133,13 @@ def main():
                     "prompt": entry.get("enhanced_prompt", entry.get("prompt", "")),
                 }
             elif args.method == "with_reasoning":
-                reasoning_text = entry.get("original_and_reasoning", "")
+                origin_prompt   = entry.get("original_prompt", entry.get("prompt", ""))
+                think           = entry.get("reasoning", "")
                 enhanced_prompt = entry.get("enhanced_prompt", entry.get("prompt", ""))
                 prompt_embeds, prompt_embeds_mask = encode_fn(
                     pipe,
-                    reasoning_text=reasoning_text,
+                    origin_prompt=origin_prompt,
+                    think=think,
                     enhanced_prompt=enhanced_prompt,
                     device=device,
                     max_sequence_length=args.max_sequence_length,
@@ -148,11 +150,13 @@ def main():
                 }
             else:
                 # weighted_reasoning
-                reasoning_text = entry.get("original_and_reasoning", "")
+                origin_prompt   = entry.get("original_prompt", entry.get("prompt", ""))
+                think           = entry.get("reasoning", "")
                 enhanced_prompt = entry.get("enhanced_prompt", entry.get("prompt", ""))
                 prompt_embeds, prompt_embeds_mask = encode_fn(
                     pipe,
-                    reasoning_text=reasoning_text,
+                    origin_prompt=origin_prompt,
+                    think=think,
                     enhanced_prompt=enhanced_prompt,
                     alpha=args.alpha,
                     device=device,

@@ -20,5 +20,5 @@ accelerate launch --num_processes ${NUM_GPUS} \
     --seed 42 \
     --n_samples 4 \
     --batch_size 1 \
-    --height 1024 \
-    --width 1024
+    --height 1328 \
+    --width 1328

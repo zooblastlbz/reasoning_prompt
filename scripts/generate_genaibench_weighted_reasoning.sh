@@ -7,7 +7,7 @@ DIFFUSION_MODEL="qwen_image"
 MODEL_PATH="/ytech_m2v5_hdd/workspace/kling_mm/Models/Qwen-Image"
 METADATA_FILE="data/enhanced/genaibench_enhanced.json"
 OUTPUT_DIR="data/generated_images/genaibench_results"
-ALPHA=0.5  # 1.0 = pure reasoning, 0.0 = pure plain
+ALPHA=0.4  # 1.0 = pure reasoning, 0.0 = pure plain
 
 accelerate launch --num_processes ${NUM_GPUS} \
     -m src.benchmark.genaibench_generate \
@@ -20,7 +20,7 @@ accelerate launch --num_processes ${NUM_GPUS} \
     --num_inference_steps 50 \
     --guidance_scale 4.0 \
     --seed 42 \
-    --n_samples 4 \
+    --n_samples 1 \
     --batch_size 1 \
-    --height 1024 \
-    --width 1024
+    --height 1328 \
+    --width 1328

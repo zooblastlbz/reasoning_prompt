@@ -18,7 +18,7 @@ accelerate launch --num_processes ${NUM_GPUS} \
     --num_inference_steps 50 \
     --guidance_scale 4.0 \
     --seed 42 \
-    --n_samples 4 \
+    --n_samples 1 \
     --batch_size 1 \
-    --height 1024 \
-    --width 1024
+    --height 1328 \
+    --width 1328
