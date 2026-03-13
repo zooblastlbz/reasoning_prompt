@@ -19,15 +19,17 @@ def encode_with_reasoning(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Encode a three-part full text (origin_prompt / think / enhanced_prompt) using
-    the pipeline's text encoder WITHOUT any token-length cap, then slice out only
-    the hidden states that correspond to the enhanced_prompt tokens.
+    the pipeline's text encoder WITHOUT any token-length cap, then slice out
+    hidden states that correspond to:
+        enhanced_prompt tokens + template suffix tokens.
 
     Each section is annotated with a plain-text prefix:
         [ORIGIN]: {origin_prompt}
         [THINK]:  {think}
         [ENHANCED]: {enhanced_prompt}
 
-    The prefix tokens of [ENHANCED] are excluded from the returned embeddings.
+    The prefix tokens before enhanced_prompt are excluded from the returned
+    embeddings.
 
     Args:
         pipeline:             QwenImagePipeline instance.
@@ -56,6 +58,7 @@ def encode_with_reasoning(
         full_prompt_embeds, full_prompt_embeds_mask,
         device, max_sequence_length,
         enhanced_char_starts=[enhanced_char_start],
+        include_template_suffix=True,
     )
 
     return prompt_embeds, prompt_embeds_mask
@@ -104,17 +107,15 @@ def encode_with_weighted_reasoning(
     plain_embeds, _ = pipeline._get_qwen_prompt_embeds([enhanced_prompt], device)
     plain_embeds = plain_embeds[:, :max_sequence_length]
 
-    # 3. Align sequence lengths
+    # 3. Enforce strict sequence-length equality
     r_len = reasoning_embeds.shape[1]
     p_len = plain_embeds.shape[1]
-    hidden_dim = reasoning_embeds.shape[2]
-
-    if r_len < p_len:
-        pad = torch.zeros((1, p_len - r_len, hidden_dim), device=device, dtype=reasoning_embeds.dtype)
-        reasoning_embeds = torch.cat([reasoning_embeds, pad], dim=1)
-    elif p_len < r_len:
-        pad = torch.zeros((1, r_len - p_len, hidden_dim), device=device, dtype=plain_embeds.dtype)
-        plain_embeds = torch.cat([plain_embeds, pad], dim=1)
+    if r_len != p_len:
+        raise ValueError(
+            "Length mismatch between reasoning and plain embeds: "
+            f"reasoning_len={r_len}, plain_len={p_len}. "
+            "Padding is disabled; please check slicing/alignment logic."
+        )
 
     # 4. Weighted combination
     final_embeds = alpha * reasoning_embeds + (1 - alpha) * plain_embeds
@@ -167,6 +168,7 @@ def batch_encode_with_reasoning(
         full_prompt_embeds, full_prompt_embeds_mask,
         device, max_sequence_length,
         enhanced_char_starts=enhanced_char_starts,
+        include_template_suffix=True,
     )
 
     return prompt_embeds, prompt_embeds_mask

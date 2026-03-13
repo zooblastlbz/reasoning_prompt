@@ -11,6 +11,20 @@ THINK_PREFIX    = "[THINK]: "
 ENHANCED_PREFIX = "[ENHANCED]:"   # ← 去掉尾部空格，改用 \n 与 enhanced_prompt 分隔
 
 
+def split_prompt_template(template: str) -> tuple[str, str]:
+    """
+    Split a template like "...{}..." into (prefix, suffix).
+
+    The Qwen image prompt template is expected to contain exactly one "{}"
+    placeholder where user text is inserted.
+    """
+    if template.count("{}") != 1:
+        raise ValueError(
+            f"prompt_template_encode must contain exactly one '{{}}', got {template.count('{}')}"
+        )
+    return template.split("{}", 1)
+
+
 def build_prefixed_full_text(origin_prompt: str, think: str, enhanced_prompt: str) -> tuple[str, int]:
     """
     Assemble the three-part full text that is fed to the text encoder.
@@ -122,10 +136,15 @@ def slice_hidden_states_by_prefix(
     device: torch.device,
     max_sequence_length: int,
     enhanced_char_starts: list[int] | None = None,
+    include_template_suffix: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Slice hidden states that correspond to the enhanced_prompt tokens only,
+    Slice hidden states that correspond to the enhanced_prompt tokens,
     excluding the '[ENHANCED]:' prefix tokens.
+
+    Optionally include template suffix tokens in the sliced length
+    (enhanced_len + template_suffix_len) to align with plain
+    _get_qwen_prompt_embeds semantics.
 
     Strategy (no return_offsets_mapping needed, works with slow tokenizers):
     -------------------------------------------------------------------------
@@ -150,6 +169,13 @@ def slice_hidden_states_by_prefix(
     """
     template = pipeline.prompt_template_encode
     drop_idx = pipeline.prompt_template_encode_start_idx
+    template_prefix, template_suffix = split_prompt_template(template)
+
+    template_suffix_token_len = 0
+    if include_template_suffix:
+        template_suffix_token_len = len(
+            pipeline.tokenizer(template_suffix, add_special_tokens=False).input_ids
+        )
 
     sliced_embeds_list = []
 
@@ -174,19 +200,18 @@ def slice_hidden_states_by_prefix(
                     if prompt_embeds_mask is not None
                     else prompt_embeds.shape[1]
                 )
-                sliced_embeds_list.append(
-                    prompt_embeds[i, :valid_len, :][:max_sequence_length]
-                )
+                sliced_embeds_list.append(prompt_embeds[i, :valid_len, :])
                 continue
             # prefix_part ends right after the trailing \n of ENHANCED_PREFIX\n
             char_start = idx + len(ENHANCED_PREFIX) + 1  # +1 for the \n separator
             prefix_part = full_text[:char_start]
 
-        # ── 2. Build the template-wrapped prefix (no enhanced_prompt) ─────────
-        # template.format(x) inserts x; we want everything up to enhanced_prompt
-        # inside the wrapped string, i.e. template.format(prefix_part) gives us
-        # exactly <template_prefix> + prefix_part.
-        wrapped_prefix = template.format(prefix_part)
+        # ── 2. Build prefix-only wrapped text (exclude template suffix) ───────
+        # We need token position where enhanced_prompt starts inside:
+        #   template_prefix + prefix_part + enhanced_prompt + template_suffix
+        # So the counting text here must be:
+        #   template_prefix + prefix_part
+        wrapped_prefix = f"{template_prefix}{prefix_part}"
 
         # ── 3. Count tokens in wrapped_prefix → tells us where enhanced_prompt
         #       starts in the full token sequence ─────────────────────────────
@@ -194,13 +219,13 @@ def slice_hidden_states_by_prefix(
             pipeline.tokenizer(wrapped_prefix, add_special_tokens=False).input_ids
         )
 
-        # ── 4. Count tokens in enhanced_prompt alone ──────────────────────────
+        # ── 4. Count tokens in enhanced_prompt (+ optional template suffix) ───
         # Safe because the leading \n boundary means BPE will produce the same
         # tokens for enhanced_prompt regardless of surrounding context.
         target_ids = pipeline.tokenizer(
             enhanced_prompt, add_special_tokens=False
         ).input_ids
-        target_len = len(target_ids)
+        target_len = len(target_ids) + template_suffix_token_len
 
         # ── 5. Convert to hidden-state index (subtract drop_idx) ─────────────
         hs_start = prefix_token_count - drop_idx
@@ -214,13 +239,10 @@ def slice_hidden_states_by_prefix(
                 if prompt_embeds_mask is not None
                 else prompt_embeds.shape[1]
             )
-            sliced_embeds_list.append(
-                prompt_embeds[i, :valid_len, :][:max_sequence_length]
-            )
+            sliced_embeds_list.append(prompt_embeds[i, :valid_len, :])
             continue
 
         sliced_embed = prompt_embeds[i, hs_start : hs_start + target_len, :]
-        sliced_embed = sliced_embed[:max_sequence_length]
         sliced_embeds_list.append(sliced_embed)
 
     # ── Pad batch to uniform length, all-ones mask ───────────────────────────
@@ -237,7 +259,15 @@ def slice_hidden_states_by_prefix(
         padded_embeds.append(embed)
         padded_masks.append(torch.ones(max_len, device=device, dtype=torch.long))
 
-    return torch.stack(padded_embeds), torch.stack(padded_masks)
+    final_embeds = torch.stack(padded_embeds)
+    final_masks = torch.stack(padded_masks)
+
+    # Final truncation happens after encoding + slicing + batch shaping.
+    if max_sequence_length is not None and final_embeds.shape[1] > max_sequence_length:
+        final_embeds = final_embeds[:, :max_sequence_length, :]
+        final_masks = final_masks[:, :max_sequence_length]
+
+    return final_embeds, final_masks
 
 
 # ---------------------------------------------------------------------------
